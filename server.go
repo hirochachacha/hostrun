@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"mime"
 	"net"
 	"net/http"
@@ -14,7 +15,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 const defaultListenAddress = "127.0.0.1:8080"
@@ -51,7 +55,10 @@ func runServe(args []string) int {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/exec", &execHandler{registry: registry})
+	mux.Handle("/exec", &execHandler{
+		registry: registry,
+		logger:   log.New(os.Stderr, "hostrun: ", log.LstdFlags),
+	})
 	fmt.Fprintf(os.Stderr, "hostrun: serving %d command(s) on %s\n", len(registry), listener.Addr())
 	if err := http.Serve(listener, mux); err != nil {
 		fmt.Fprintf(os.Stderr, "hostrun: %v\n", err)
@@ -116,44 +123,70 @@ func validateName(name string) error {
 
 type execHandler struct {
 	registry map[string]string
+	logger   *log.Logger
+	nextID   atomic.Uint64
 }
 
 func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	id := h.nextID.Add(1)
+	started := time.Now()
+	status := http.StatusOK
+	exitCode := "-"
+	var responseError string
+	defer func() {
+		h.logger.Printf("response id=%d status=%d exit_code=%s duration=%s error=%q",
+			id, status, exitCode, time.Since(started), responseError)
+	}()
+	respondError := func(code int, message string) {
+		status = code
+		responseError = message
+		writeJSONError(w, code, message)
+	}
+
 	if r.Method != http.MethodPost {
+		h.logRequest(id, r, "", nil)
 		w.Header().Set("Allow", http.MethodPost)
-		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		respondError(http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	if !isJSONContentType(r.Header.Get("Content-Type")) {
-		writeJSONError(w, http.StatusBadRequest, "Content-Type must be application/json")
+		h.logRequest(id, r, "", nil)
+		respondError(http.StatusBadRequest, "Content-Type must be application/json")
 		return
 	}
 
 	var req execRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		h.logRequest(id, r, "", nil)
+		respondError(http.StatusBadRequest, "invalid request body")
 		return
 	}
+	h.logRequest(id, r, req.Command, req.Args)
 	if req.Command == "" {
-		writeJSONError(w, http.StatusBadRequest, "command is required")
+		respondError(http.StatusBadRequest, "command is required")
 		return
 	}
 	path, allowed := h.registry[req.Command]
 	if !allowed {
-		writeJSONError(w, http.StatusForbidden, "command is not allowed")
+		respondError(http.StatusForbidden, "command is not allowed")
 		return
 	}
 
 	stdout, stderr, code, err := execute(path, req.Args)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		respondError(http.StatusInternalServerError, err.Error())
 		return
 	}
+	exitCode = strconv.Itoa(code)
 	writeJSON(w, http.StatusOK, execResponse{
 		ExitCode: code,
 		Stdout:   base64.StdEncoding.EncodeToString(stdout),
 		Stderr:   base64.StdEncoding.EncodeToString(stderr),
 	})
+}
+
+func (h *execHandler) logRequest(id uint64, r *http.Request, command string, args []string) {
+	h.logger.Printf("request id=%d method=%s path=%q command=%q args=%q", id, r.Method, r.URL.Path, command, args)
 }
 
 func isJSONContentType(value string) bool {

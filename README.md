@@ -56,6 +56,11 @@ The public `NAME` is an opaque identifier, never a file path. Duplicate names,
 invalid names, and missing or non-executable files are startup errors. The
 server runs in the foreground; it does not daemonize.
 
+For each `/exec` request, the server logs the method, path, command name, and
+arguments, then the HTTP status, command exit code (if run), elapsed time,
+and any error. Each pair shares an ID so concurrent requests can be matched.
+Logs go to the server's stderr and do not include command output.
+
 ## Client
 
 ```text

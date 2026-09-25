@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -93,9 +96,38 @@ func TestHandlerRejectsDisallowedCommand(t *testing.T) {
 	}
 }
 
+func TestHandlerLogsRequestAndResponse(t *testing.T) {
+	t.Setenv("HOSTRUN_HELPER", "1")
+	t.Setenv("HOSTRUN_HELPER_EXIT_CODE", "7")
+	var logs bytes.Buffer
+	handler := &execHandler{
+		registry: map[string]string{"helper": os.Args[0]},
+		logger:   log.New(&logs, "", 0),
+	}
+	request := httptest.NewRequest(http.MethodPost, "/exec", strings.NewReader(`{"command":"helper","args":["--","search term"]}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	got := logs.String()
+	if !strings.Contains(got, `request id=1 method=POST path="/exec" command="helper" args=["--" "search term"]`) ||
+		!strings.Contains(got, `response id=1 status=200 exit_code=7 duration=`) {
+		t.Errorf("logs = %q", got)
+	}
+	if strings.Contains(got, "stdout=") || strings.Contains(got, "stderr=") || strings.Contains(got, "helper-stderr") {
+		t.Errorf("logs include command output: %q", got)
+	}
+}
+
 func postExec(t *testing.T, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	handler := &execHandler{registry: map[string]string{"echo": "/bin/echo"}}
+	handler := &execHandler{
+		registry: map[string]string{"echo": "/bin/echo"},
+		logger:   log.New(io.Discard, "", 0),
+	}
 	request := httptest.NewRequest(http.MethodPost, "/exec", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
